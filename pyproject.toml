@@ -1,0 +1,10 @@
+[project]
+name = "edgeup"
+version = "0.1.0"
+description = "边缘设备升级系统（第一版，虚拟设备验证）"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
