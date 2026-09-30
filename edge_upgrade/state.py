@@ -36,7 +36,10 @@ class UpgradeState:
     target_slot: str | None = None
     payload_size: int = 0
     payload_sha256: str | None = None
+    data_format: int | None = None       # 新固件要求的数据格式
     received: int = 0            # 仅作缓存；恢复时以磁盘真实长度覆盖
+    trial_booted: bool = False   # 候选槽是否已经试启动过（用于失联判定）
+    committed: bool = False      # 两阶段提交标记：已切程序，待切数据
     result: str | None = None    # 终态结论说明
     attempts: int = 0
     updated_at: float = 0.0

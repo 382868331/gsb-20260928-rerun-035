@@ -19,7 +19,7 @@ def package_factory(tmp_path):
     created = []
 
     def _make(name="pkg.fwpkg", *, version="2.0.0", boot_ok=True, health_ok=True,
-              min_device="0.0.0", max_device=None):
+              min_device="0.0.0", max_device=None, data_format=1, migrate_ok=True):
         path = build_package(
             tmp_path / name,
             version=version,
@@ -27,6 +27,8 @@ def package_factory(tmp_path):
             max_device_version=max_device,
             boot_ok=boot_ok,
             health_ok=health_ok,
+            data_format=data_format,
+            migrate_ok=migrate_ok,
         )
         created.append(path)
         return load_package(path)

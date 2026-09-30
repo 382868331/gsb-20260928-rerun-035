@@ -36,6 +36,10 @@ class DeviceError(RuntimeError):
     """设备侧操作失败（槽损坏、写入断档等）。"""
 
 
+class DeviceOfflineError(DeviceError):
+    """设备试启动后失联：健康确认无法送达。"""
+
+
 @dataclass(frozen=True)
 class BootResult:
     ok: bool
@@ -90,6 +94,11 @@ class VirtualDevice:
         self.trial_path = self.boot_dir / "trial.json"
         self.staging_path = self.staging_dir / "firmware.part"
         self.expected_path = self.staging_dir / "expected.json"
+        # 模拟链路：False 表示设备失联（boot/确认通道不可达）
+        self.online = True
+
+    def set_online(self, online: bool) -> None:
+        self.online = bool(online)
 
     # ---------- 初始化与基本信息 ----------
 
@@ -273,6 +282,8 @@ class VirtualDevice:
 
     def boot(self) -> BootResult:
         """（模拟一次上电启动）有试启动标记则从候选槽启动并累计尝试次数。"""
+        if not self.online:
+            raise DeviceOfflineError("设备试启动后失联：启动/健康通道不可达")
         trial = self.trial()
         if trial is not None:
             slot = trial["slot"]
@@ -294,6 +305,8 @@ class VirtualDevice:
 
     def commit_trial(self) -> str:
         """确认新版本可用：活动指针切到试启动槽，旧槽保留（供下次升级覆盖）。"""
+        if not self.online:
+            raise DeviceOfflineError("健康确认到达前设备失联，无法提交试启动")
         trial = self.trial()
         if trial is None:
             raise DeviceError("没有待确认的试启动")

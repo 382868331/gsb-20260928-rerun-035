@@ -9,6 +9,8 @@
     version      固件版本（与 manifest 一致）
     boot_ok      试启动时是否成功（用于模拟坏包）
     health_ok    健康检查是否通过
+    data_format  新程序要求的数据格式版本（默认 1，表示数据无变化）
+    migrate_ok   数据迁移是否允许成功（False 用于模拟迁移失败）
 """
 
 from __future__ import annotations
@@ -60,6 +62,7 @@ class Manifest:
     max_device_version: str | None
     payload_size: int
     payload_sha256: str
+    data_format: int
     metadata: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
@@ -72,6 +75,7 @@ class Manifest:
             },
             "payload_size": self.payload_size,
             "payload_sha256": self.payload_sha256,
+            "data_format": self.data_format,
             "metadata": self.metadata,
         }
 
@@ -90,6 +94,7 @@ class Manifest:
                 ),
                 payload_size=int(data["payload_size"]),
                 payload_sha256=str(data["payload_sha256"]),
+                data_format=int(data.get("data_format", 1)),
                 metadata=dict(data.get("metadata", {})),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -111,6 +116,11 @@ class FirmwarePackage:
     def version(self) -> str:
         return self.manifest.version
 
+    @property
+    def data_format(self) -> int:
+        """新固件要求的数据格式版本（默认 1，即数据格式无变化）。"""
+        return int(self.firmware_spec().get("data_format", 1))
+
     def firmware_spec(self) -> dict[str, Any]:
         """虚拟设备固件行为描述（payload 为 JSON）。"""
         try:
@@ -130,6 +140,8 @@ def make_firmware_payload(
     *,
     boot_ok: bool = True,
     health_ok: bool = True,
+    data_format: int = 1,
+    migrate_ok: bool = True,
     extra: dict[str, Any] | None = None,
 ) -> bytes:
     """构造虚拟设备固件 payload（测试包用）。"""
@@ -137,6 +149,8 @@ def make_firmware_payload(
         "version": version,
         "boot_ok": bool(boot_ok),
         "health_ok": bool(health_ok),
+        "data_format": int(data_format),
+        "migrate_ok": bool(migrate_ok),
     }
     if extra:
         spec.update(extra)
@@ -152,6 +166,8 @@ def build_package(
     payload: bytes | None = None,
     boot_ok: bool = True,
     health_ok: bool = True,
+    data_format: int = 1,
+    migrate_ok: bool = True,
     metadata: dict[str, Any] | None = None,
 ) -> Path:
     """生成一个测试用升级包，返回写入路径。"""
@@ -162,7 +178,10 @@ def build_package(
         if _cmp(min_device_version, max_device_version) > 0:
             raise ValueError("min_device_version 不能大于 max_device_version")
     if payload is None:
-        payload = make_firmware_payload(version, boot_ok=boot_ok, health_ok=health_ok)
+        payload = make_firmware_payload(
+            version, boot_ok=boot_ok, health_ok=health_ok,
+            data_format=data_format, migrate_ok=migrate_ok,
+        )
     digest = hashlib.sha256(payload).hexdigest()
     manifest = Manifest(
         package_id=f"fw-{version}-{digest[:12]}",
@@ -171,6 +190,7 @@ def build_package(
         max_device_version=max_device_version,
         payload_size=len(payload),
         payload_sha256=digest,
+        data_format=data_format,
         metadata=metadata or {},
     )
     out = Path(output_path)

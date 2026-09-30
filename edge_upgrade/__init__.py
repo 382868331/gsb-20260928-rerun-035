@@ -14,8 +14,10 @@ from .package import (
     check_compatibility,
 )
 from .device import VirtualDevice, BootResult
+from .migrations import DataStore, MigrationError, migrate_document
 from .state import UpgradeState, Stage
 from .manager import UpgradeManager, ReceiveResult, ActivateResult
+from .fleet import BatchUpgradeOrchestrator, BatchReport, DeviceFault, DeviceStatus
 
 __all__ = [
     "FirmwarePackage",
@@ -23,11 +25,18 @@ __all__ = [
     "check_compatibility",
     "VirtualDevice",
     "BootResult",
+    "DataStore",
+    "MigrationError",
+    "migrate_document",
     "UpgradeState",
     "Stage",
     "UpgradeManager",
     "ReceiveResult",
     "ActivateResult",
+    "BatchUpgradeOrchestrator",
+    "BatchReport",
+    "DeviceFault",
+    "DeviceStatus",
 ]
 
 __version__ = "0.1.0"

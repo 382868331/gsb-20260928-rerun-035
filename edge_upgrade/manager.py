@@ -1,4 +1,12 @@
-"""升级编排器：把升级包、虚拟设备和持久化状态串成完整流程。
+"""升级编排器：升级包、虚拟设备、数据迁移与持久化状态的事务编排。
+
+第二版在第一版（A/B 槽、分段续传、试启动回退）之上增加：
+
+* **带数据格式变化的升级**：新固件声明 ``data_format``，试启动前在
+  ``data/trial`` 隔离副本上跑迁移，活动数据 ``data/current`` 原地不变；
+* **程序与数据同一事务提交**：健康确认后两阶段切换（先落提交标记，再切
+  槽指针，再切数据），任何一步断电都能对账——要么整套新版，要么整套旧版；
+* **试启动/确认分离**：失联时保留待确认现场，重复确认幂等。
 
 典型流程::
 
@@ -7,21 +15,24 @@
     for chunk in chunks:                     # 分段写入（可重复、可断电续传）
         manager.write_segment(offset, chunk)
     manager.finish_download()                # 真实内容校验后装入非活动槽
-    result = manager.boot_and_confirm()      # 试启动 + 健康检查 -> 提交/回退
+    manager.start_trial()                    # 隔离迁移 + 候选槽试启动/健康检查
+    manager.confirm()                        # 健康确认：程序与数据原子切换
 
 断电恢复::
 
     manager = UpgradeManager.open(root)      # 自动按真实磁盘内容对账
-    manager.recovery_report()                # 下载中 -> 续传；试启动未确认 -> 回退
+    manager.recovery_report()  # 下载中->续传；未确认->整套回退；半提交->补齐
 """
 
 from __future__ import annotations
 
 import enum
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .device import BootResult, DeviceError, VirtualDevice
+from .device import BootResult, DeviceError, DeviceOfflineError, VirtualDevice
+from .migrations import DataStore, MigrationError
 from .package import (
     FirmwarePackage,
     IncompatibleError,
@@ -45,9 +56,13 @@ class ReceiveResult(str, enum.Enum):
 
 
 class ActivateResult(str, enum.Enum):
-    COMMITTED = "committed"                          # 试启动+健康通过，已提交
+    COMMITTED = "committed"                          # 健康确认通过，程序+数据已提交
+    TRIAL_STARTED = "trial_started"                  # 试启动健康，等待显式确认
+    ALREADY_CONFIRMED = "already_confirmed"          # 确认重复到达（幂等忽略）
+    MIGRATION_FAILED_ROLLED_BACK = "migration_failed"  # 数据迁移失败，已回退
     TRIAL_BOOT_FAILED_ROLLED_BACK = "boot_failed"   # 启动失败，已回退
     HEALTH_CHECK_FAILED_ROLLED_BACK = "unhealthy"   # 启动了但不健康，已回退
+    LOST_CONTACT = "lost_contact"                    # 试启动后失联，现场保留待恢复
     UNCONFIRMED_ROLLED_BACK = "unconfirmed_reboot"  # 重启前未确认，已回退
     INCOMPLETE = "incomplete"                        # 固件没收全，不能安装
     NOTHING = "nothing"                              # 没有待激活的升级
@@ -67,6 +82,7 @@ class ActivationOutcome:
     boot: BootResult | None = None
     active_slot: str = ""
     active_version: str | None = None
+    data_format: int | None = None
     message: str = ""
 
 
@@ -74,6 +90,7 @@ class UpgradeManager:
     def __init__(self, device: VirtualDevice, store: StateStore):
         self.device = device
         self.store = store
+        self.data = DataStore(device.root)
         self.state: UpgradeState = store.load()
         self._reconcile_after_reboot()
 
@@ -85,8 +102,10 @@ class UpgradeManager:
         return cls(VirtualDevice(root), StateStore(root))
 
     @classmethod
-    def initialize(cls, root: str | Path, factory_version: str = "1.0.0") -> "UpgradeManager":
+    def initialize(cls, root: str | Path, factory_version: str = "1.0.0",
+                   factory_data: dict | None = None) -> "UpgradeManager":
         VirtualDevice.initialize(root, factory_version)
+        DataStore(root).initialize(factory_data)
         manager = cls.open(root)
         manager.store.save(manager.state)
         return manager
@@ -109,10 +128,27 @@ class UpgradeManager:
                 self.state.received = int(info["bytes_written"])
                 self.store.save(self.state)
         elif stage == Stage.PENDING_TRIAL:
-            # 重启发生在“试启动之后、确认之前”：新版本从未被确认，
-            # 安全策略是回到旧版本（旧槽一直完好保留）。
+            self._reconcile_pending_trial()
+
+    def _reconcile_pending_trial(self) -> None:
+        """按磁盘现场对账待确认/半提交的升级。"""
+        trial = self.device.trial()
+        # 1) 两阶段提交做了一半：程序槽指针已切、数据尚未切 -> 补齐事务
+        if self.state.committed and trial is not None:
+            slot = trial["slot"]
+            if self.device.active_slot == slot:
+                self.data.commit_trial()
+                self._finalize_commit(slot, "重启后检测到半完成提交，已补齐数据切换")
+                return
+        # 2) 试启动之后失联/未确认就重启：整套（程序+数据）回到旧版。
+        #    旧槽固件从未被覆盖，current 数据从未被原地修改，回退是配套的。
+        if self.state.trial_booted:
             self._rollback(ActivateResult.UNCONFIRMED_ROLLED_BACK,
-                           "重启前新版本未完成确认，已回退到旧版本")
+                           "试启动后未在确认期内完成确认，已整套回退到旧程序+旧数据")
+            return
+        # 3) 尚未试启动（迁移前/迁移中重启）：同样回到旧版，等待重新投递
+        self._rollback(ActivateResult.UNCONFIRMED_ROLLED_BACK,
+                       "重启前尚未进入试启动，已丢弃隔离副本并回退")
 
     def _reset_idle(self, reason: str) -> None:
         self.state = UpgradeState()
@@ -127,6 +163,7 @@ class UpgradeManager:
             "total": self.state.payload_size,
             "active_slot": self.device.active_slot,
             "active_version": self.device.current_version,
+            "data_format": self.data.current_format,
             "pending_package": self.state.package_id,
             "message": self.state.result,
         }
@@ -195,6 +232,7 @@ class UpgradeManager:
             target_slot=target,
             payload_size=len(pkg.payload),
             payload_sha256=pkg.manifest.payload_sha256,
+            data_format=pkg.manifest.data_format,
             received=0,
         )
         self.store.save(self.state)
@@ -209,6 +247,7 @@ class UpgradeManager:
         """中止当前升级，清空暂存并回到 IDLE。"""
         self.device.discard_staging()
         self.device.clear_trial()
+        self.data.rollback_trial()
         self._reset_idle("升级已手动中止")
 
     # ---------- 阶段二：分段写入 ----------
@@ -268,17 +307,68 @@ class UpgradeManager:
             f"固件已装入槽 {target}，等待试启动确认",
         )
 
-    # ---------- 阶段四：试启动 + 健康检查；失败即回退 ----------
+    # ---------- 阶段四：隔离迁移 + 试启动（与显式确认分离） ----------
 
-    def boot_and_confirm(self) -> ActivationOutcome:
+    def start_trial(self) -> ActivationOutcome:
+        """在隔离数据副本上迁移，并从候选槽试启动 + 健康检查。
+
+        成功只表示“候选版本健康”，活动槽与活动数据都不切换，等待
+        ``confirm()`` 的显式健康确认。
+        """
+        if self.state.stage == Stage.CONFIRMED:
+            return ActivationOutcome(
+                ActivateResult.ALREADY_CONFIRMED,
+                active_slot=self.device.active_slot,
+                active_version=self.device.current_version,
+                data_format=self.data.current_format,
+                message="该升级已确认，重复启动试启动被忽略",
+            )
         if self.state.stage != Stage.PENDING_TRIAL:
             return ActivationOutcome(
                 ActivateResult.NOTHING,
                 active_slot=self.device.active_slot,
                 active_version=self.device.current_version,
-                message="当前没有待确认的升级",
+                data_format=self.data.current_format,
+                message="当前没有待试启动的升级",
             )
-        boot = self.device.boot()
+
+        trial = self.device.trial()
+        if trial is None:
+            return ActivationOutcome(
+                ActivateResult.NOTHING,
+                active_slot=self.device.active_slot,
+                active_version=self.device.current_version,
+                data_format=self.data.current_format,
+                message="试启动标记缺失，无法启动候选版本",
+            )
+
+        # 1) 隔离迁移：只写 data/trial，data/current 一个字节都不改
+        target_format = int(self.state.data_format or 1)
+        try:
+            spec = json.loads(
+                self.device.read_slot_firmware(trial["slot"]).decode("utf-8")
+            )
+            if spec.get("migrate_ok", True) is False and target_format != self.data.current_format:
+                raise MigrationError("新程序拒绝迁移当前数据（模拟迁移失败）")
+            report = self.data.prepare_trial_copy(target_format)
+        except MigrationError as exc:
+            return self._rollback(ActivateResult.MIGRATION_FAILED_ROLLED_BACK,
+                                  f"数据迁移失败，旧数据保持原样: {exc}")
+
+        # 2) 候选槽试启动 + 健康检查（在迁移后的隔离副本上运行）
+        self.state.trial_booted = True
+        self.store.save(self.state)
+        try:
+            boot = self.device.boot()
+        except DeviceOfflineError as exc:
+            # 失联不回退也不提交：保留现场，等设备重新可达后确认或重启对账
+            return ActivationOutcome(
+                ActivateResult.LOST_CONTACT,
+                active_slot=self.device.active_slot,
+                active_version=self.device.current_version,
+                data_format=self.data.current_format,
+                message=f"试启动后设备失联，保留旧程序+旧数据在线: {exc}",
+            )
         self.state.attempts += 1
         self.store.save(self.state)
         if not boot.ok:
@@ -286,23 +376,110 @@ class UpgradeManager:
                                   boot.reason or "试启动失败", boot)
         if not boot.healthy:
             return self._rollback(ActivateResult.HEALTH_CHECK_FAILED_ROLLED_BACK,
-                                  boot.reason or "健康检查失败", boot)
-        slot = self.device.commit_trial()
-        self.state.stage = Stage.CONFIRMED
-        self.state.result = f"版本 {boot.version} 在槽 {slot} 试启动与健康检查通过，已提交"
-        self.store.save(self.state)
+                                  boot.reason or "健康检查失败")
+
+        migrated = "并完成数据迁移" if report.migrated else "数据格式无需迁移"
         return ActivationOutcome(
-            ActivateResult.COMMITTED, boot, slot, boot.version, self.state.result
+            ActivateResult.TRIAL_STARTED,
+            boot,
+            self.device.active_slot,
+            self.device.current_version,
+            self.data.current_format,
+            f"候选版本 {boot.version} 试启动健康（{migrated}），等待健康确认",
         )
+
+    # ---------- 阶段五：显式健康确认（程序 + 数据同一事务） ----------
+
+    def confirm(self) -> ActivationOutcome:
+        """健康确认：两阶段提交，保证程序版本与数据格式成套。"""
+        if self.state.stage == Stage.CONFIRMED:
+            # 确认重复到达：幂等，不做任何磁盘改动
+            return ActivationOutcome(
+                ActivateResult.ALREADY_CONFIRMED,
+                active_slot=self.device.active_slot,
+                active_version=self.device.current_version,
+                data_format=self.data.current_format,
+                message="确认重复到达，升级早已提交，本次忽略",
+            )
+        if self.state.stage != Stage.PENDING_TRIAL:
+            return ActivationOutcome(
+                ActivateResult.NOTHING,
+                active_slot=self.device.active_slot,
+                active_version=self.device.current_version,
+                data_format=self.data.current_format,
+                message="当前没有待确认的升级",
+            )
+        trial = self.device.trial()
+        if trial is None:
+            return self._rollback(ActivateResult.UNCONFIRMED_ROLLED_BACK,
+                                  "试启动标记丢失，无法确认，已回退")
+        slot = trial["slot"]
+        if self.device.active_slot == slot:
+            # 半提交恢复路径：程序已切，补切数据
+            new_format = self.data.commit_trial()
+            self._finalize_commit(slot, "补提交：程序已切换，数据已补齐")
+            return self._committed_outcome(new_format)
+
+        try:
+            if not self.device.online:
+                raise DeviceOfflineError("确认到达时设备仍失联")
+        except DeviceOfflineError as exc:
+            return ActivationOutcome(
+                ActivateResult.LOST_CONTACT,
+                active_slot=self.device.active_slot,
+                active_version=self.device.current_version,
+                data_format=self.data.current_format,
+                message=f"设备失联，确认无法送达，旧程序+旧数据保持在线: {exc}",
+            )
+
+        # 两阶段提交：先落“已决定提交”标记（带 fsync），再切程序槽，
+        # 最后切数据。任一步断电，重启对账时都能把事务补齐或整体回退。
+        self.state.committed = True
+        self.store.save(self.state)
+        self.device.commit_trial()                 # 阶段一：活动槽 -> 新程序
+        new_format = self.data.commit_trial()      # 阶段二：活动数据 -> 新格式
+        self._finalize_commit(slot, f"版本与数据（格式 {new_format}）已成套提交")
+        return self._committed_outcome(new_format)
+
+    def _finalize_commit(self, slot: str, message: str) -> None:
+        self.state.stage = Stage.CONFIRMED
+        self.state.trial_booted = False
+        self.state.committed = False
+        self.state.result = message + f"，活动槽 {slot}"
+        self.store.save(self.state)
+
+    def _committed_outcome(self, new_format: int) -> ActivationOutcome:
+        slot = self.device.active_slot
+        return ActivationOutcome(
+            ActivateResult.COMMITTED, None, slot,
+            self.device.current_version, new_format, self.state.result,
+        )
+
+    def boot_and_confirm(self) -> ActivationOutcome:
+        """便捷方法：试启动通过后立即确认（第一版 API 兼容）。
+
+        试启动失联时不做确认，返回 ``LOST_CONTACT`` 保留现场。
+        """
+        trial_outcome = self.start_trial()
+        if trial_outcome.result in (
+            ActivateResult.TRIAL_STARTED,
+        ):
+            return self.confirm()
+        return trial_outcome
 
     def _rollback(self, kind: ActivateResult, message: str,
                   boot: BootResult | None = None) -> ActivationOutcome:
-        old_slot = self.device.rollback_trial()  # 旧槽从未被覆盖，指针回旧槽
+        old_slot = self.device.active_slot
+        self.device.rollback_trial()  # 旧槽从未被覆盖，指针维持旧槽
         self.device.discard_staging()
+        self.data.rollback_trial()    # 丢弃隔离副本，旧格式数据原样保留
         if self.state.stage in (Stage.PENDING_TRIAL, Stage.DOWNLOADING):
             self.state.stage = Stage.ROLLED_BACK
+        self.state.trial_booted = False
+        self.state.committed = False
         self.state.result = message
         self.store.save(self.state)
         return ActivationOutcome(
-            kind, boot, old_slot, self.device.slot_version(old_slot), message
+            kind, boot, old_slot, self.device.slot_version(old_slot),
+            self.data.current_format, message,
         )

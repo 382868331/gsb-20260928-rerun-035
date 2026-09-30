@@ -5,6 +5,7 @@
     python tools/make_package.py out/pkg-2.0.fwpkg --version 2.0.0 \\
         --min-device 1.0.0 --max-device 1.9.9
     python tools/make_package.py out/bad-boot.fwpkg --version 2.1.0 --boot-fail
+    python tools/make_package.py out/v2.fwpkg --version 2.0.0 --data-format 2
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ def main() -> int:
     p.add_argument("--max-device", default=None, help="允许的最高设备版本（不含则不封顶）")
     p.add_argument("--boot-fail", action="store_true", help="生成试启动失败的固件")
     p.add_argument("--health-fail", action="store_true", help="生成健康检查失败的固件")
+    p.add_argument("--migrate-fail", action="store_true", help="生成数据迁移失败的固件")
+    p.add_argument("--data-format", type=int, default=1, help="新固件要求的数据格式版本")
     args = p.parse_args()
 
     path = build_package(
@@ -35,6 +38,8 @@ def main() -> int:
         max_device_version=args.max_device,
         boot_ok=not args.boot_fail,
         health_ok=not args.health_fail,
+        migrate_ok=not args.migrate_fail,
+        data_format=args.data_format,
     )
     print(f"已生成测试包: {path}")
     return 0
