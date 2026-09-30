@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .migration import INITIAL_FORMAT
+
 MANIFEST_NAME = "manifest.json"
 PAYLOAD_NAME = "payload.bin"
 PACKAGE_EXT = ".fwpkg"
@@ -56,6 +58,7 @@ def _cmp(a: str, b: str) -> int:
 class Manifest:
     package_id: str
     version: str
+    data_format: int
     min_device_version: str
     max_device_version: str | None
     payload_size: int
@@ -66,6 +69,7 @@ class Manifest:
         return {
             "package_id": self.package_id,
             "version": self.version,
+            "data_format": self.data_format,
             "compatibility": {
                 "min_device_version": self.min_device_version,
                 "max_device_version": self.max_device_version,
@@ -82,6 +86,7 @@ class Manifest:
             return cls(
                 package_id=str(data["package_id"]),
                 version=str(data["version"]),
+                data_format=int(data.get("data_format", INITIAL_FORMAT)),
                 min_device_version=str(compat["min_device_version"]),
                 max_device_version=(
                     str(compat["max_device_version"])
@@ -130,6 +135,7 @@ def make_firmware_payload(
     *,
     boot_ok: bool = True,
     health_ok: bool = True,
+    migration_ok: bool = True,
     extra: dict[str, Any] | None = None,
 ) -> bytes:
     """构造虚拟设备固件 payload（测试包用）。"""
@@ -137,6 +143,7 @@ def make_firmware_payload(
         "version": version,
         "boot_ok": bool(boot_ok),
         "health_ok": bool(health_ok),
+        "migration_ok": bool(migration_ok),
     }
     if extra:
         spec.update(extra)
@@ -147,26 +154,33 @@ def build_package(
     output_path: str | Path,
     *,
     version: str,
+    data_format: int = INITIAL_FORMAT,
     min_device_version: str = "0.0.0",
     max_device_version: str | None = None,
     payload: bytes | None = None,
     boot_ok: bool = True,
     health_ok: bool = True,
+    migration_ok: bool = True,
     metadata: dict[str, Any] | None = None,
 ) -> Path:
     """生成一个测试用升级包，返回写入路径。"""
     parse_version(version)
     parse_version(min_device_version)
+    if int(data_format) < INITIAL_FORMAT:
+        raise ValueError("data_format 必须 >= 1")
     if max_device_version is not None:
         parse_version(max_device_version)
         if _cmp(min_device_version, max_device_version) > 0:
             raise ValueError("min_device_version 不能大于 max_device_version")
     if payload is None:
-        payload = make_firmware_payload(version, boot_ok=boot_ok, health_ok=health_ok)
+        payload = make_firmware_payload(
+            version, boot_ok=boot_ok, health_ok=health_ok, migration_ok=migration_ok
+        )
     digest = hashlib.sha256(payload).hexdigest()
     manifest = Manifest(
         package_id=f"fw-{version}-{digest[:12]}",
         version=version,
+        data_format=int(data_format),
         min_device_version=min_device_version,
         max_device_version=max_device_version,
         payload_size=len(payload),

@@ -16,6 +16,13 @@ from .package import (
 from .device import VirtualDevice, BootResult
 from .state import UpgradeState, Stage
 from .manager import UpgradeManager, ReceiveResult, ActivateResult
+from .migration import (
+    INITIAL_FORMAT,
+    migrate_dataset,
+    migration_path_exists,
+    MigrationError,
+)
+from .fleet import FleetOrchestrator, Rollout, DeviceStatus, DeviceRecord
 
 __all__ = [
     "FirmwarePackage",
@@ -28,6 +35,14 @@ __all__ = [
     "UpgradeManager",
     "ReceiveResult",
     "ActivateResult",
+    "migrate_dataset",
+    "migration_path_exists",
+    "MigrationError",
+    "INITIAL_FORMAT",
+    "FleetOrchestrator",
+    "Rollout",
+    "DeviceStatus",
+    "DeviceRecord",
 ]
 
 __version__ = "0.1.0"

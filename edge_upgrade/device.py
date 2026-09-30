@@ -5,16 +5,24 @@
     root/
       boot/
         active        已确认的活动槽（"A" 或 "B"），原子替换
-        trial.json    试启动标记 {slot, version, attempts}，存在即表示待确认
+        trial.json    试启动标记 {slot, version, data_format, attempts, verified}
+                       存在即表示待确认；程序槽与数据槽按名字一一配对
       slots/
         A/firmware.bin, A/info.json
         B/firmware.bin, B/info.json
+      data/
+        A/data.json, A/info.json     与槽配对的业务数据及格式版本
+        B/data.json, B/info.json
       staging/
         firmware.part  分段下载/写入的暂存区
         expected.json  目标槽、期望大小与 sha256
 
 所有“已写内容”以磁盘上 staging 文件的真实字节为准，内存里不缓存固件，
 因此进程重启（模拟断电）后可以直接按真实长度续传。
+
+升级事务以“槽”为单位：固件和该版本对应的格式数据放在同一个槽名下面。
+提交只是原子切换活动指针；回退时旧槽的程序和旧格式数据都原封不动，
+不会出现“程序回退了、数据却是新格式”的错配。
 """
 
 from __future__ import annotations
@@ -26,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .migration import INITIAL_FORMAT, initial_dataset
 from .package import make_firmware_payload
 
 SLOT_A = "A"
@@ -85,6 +94,7 @@ class VirtualDevice:
         self.root = Path(root)
         self.boot_dir = self.root / "boot"
         self.slots_dir = self.root / "slots"
+        self.data_dir = self.root / "data"
         self.staging_dir = self.root / "staging"
         self.active_path = self.boot_dir / "active"
         self.trial_path = self.boot_dir / "trial.json"
@@ -102,6 +112,7 @@ class VirtualDevice:
         dev.boot_dir.mkdir(parents=True, exist_ok=True)
         payload = make_firmware_payload(factory_version)
         dev._write_slot(SLOT_A, payload)
+        dev._write_data(SLOT_A, initial_dataset(), INITIAL_FORMAT)
         atomic_write_bytes(dev.active_path, SLOT_A.encode("ascii"))
         return dev
 
@@ -142,6 +153,71 @@ class VirtualDevice:
             {"version": json.loads(payload.decode("utf-8"))["version"],
              "sha256": hashlib.sha256(payload).hexdigest()},
         )
+
+    # ---------- 数据槽（与程序槽配对，承载业务数据及其格式版本） ----------
+
+    def _data_dir(self, slot: str) -> Path:
+        if slot not in (SLOT_A, SLOT_B):
+            raise DeviceError(f"未知槽: {slot}")
+        return self.data_dir / slot
+
+    def data_format(self, slot: str) -> int | None:
+        info = self._data_dir(slot) / "info.json"
+        if not info.exists():
+            return None
+        return int(read_json(info).get("format"))
+
+    def read_data(self, slot: str) -> dict[str, Any]:
+        data_file = self._data_dir(slot) / "data.json"
+        if not data_file.exists():
+            raise DeviceError(f"槽 {slot} 没有业务数据")
+        return read_json(data_file)
+
+    def _write_data(self, slot: str, doc: dict[str, Any], data_format: int) -> None:
+        """原子写入一个槽的数据与格式信息（供初始化和迁移落盘用）。"""
+        directory = self._data_dir(slot)
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(doc, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        atomic_write_bytes(directory / "data.json", payload)
+        atomic_write_json(
+            directory / "info.json",
+            {"format": int(data_format),
+             "sha256": hashlib.sha256(payload).hexdigest()},
+        )
+
+    def clone_data(self, source_slot: str, target_slot: str) -> dict[str, Any]:
+        """把源槽数据复制一份隔离副本到目标槽，返回副本内容。
+
+        目标槽的数据会被整体替换（原子写），源槽数据从不修改。
+        """
+        fmt = self.data_format(source_slot)
+        if fmt is None:
+            raise DeviceError(f"源槽 {source_slot} 缺少数据格式信息，无法迁移")
+        doc = self.read_data(source_slot)
+        clone = json.loads(json.dumps(doc))  # 深拷贝，杜绝引用别名
+        self._write_data(target_slot, clone, fmt)
+        return clone
+
+    def migrate_data_in_slot(
+        self,
+        slot: str,
+        migrated: dict[str, Any],
+        new_format: int,
+    ) -> None:
+        """把已经迁移好的数据原子落盘到该槽，替换其隔离副本。"""
+        old_format = self.data_format(slot)
+        if old_format is None:
+            raise DeviceError(f"槽 {slot} 尚无数据副本，无法写入迁移结果")
+        self._write_data(slot, migrated, new_format)
+
+    def discard_slot(self, slot: str) -> None:
+        """删除非活动槽上的固件与数据（回退清理；活动槽永远不会被调用）。"""
+        import shutil
+
+        if slot == self.active_slot:
+            raise DeviceError("拒绝清理当前活动槽")
+        for directory in (self._slot_dir(slot), self._data_dir(slot)):
+            shutil.rmtree(directory, ignore_errors=True)
 
     def read_slot_firmware(self, slot: str) -> bytes:
         fw = self._slot_dir(slot) / "firmware.bin"
@@ -254,11 +330,13 @@ class VirtualDevice:
 
     # ---------- 试启动 / 确认 / 回退 ----------
 
-    def begin_trial(self, slot: str, version: str) -> None:
+    def begin_trial(self, slot: str, version: str, data_format: int) -> None:
         if slot == self.active_slot:
             raise DeviceError("试启动槽不能是当前活动槽")
         atomic_write_json(
-            self.trial_path, {"slot": slot, "version": version, "attempts": 0}
+            self.trial_path,
+            {"slot": slot, "version": version,
+             "data_format": int(data_format), "attempts": 0, "verified": False},
         )
 
     def trial(self) -> dict[str, Any] | None:
@@ -277,26 +355,57 @@ class VirtualDevice:
         if trial is not None:
             slot = trial["slot"]
             trial["attempts"] = int(trial.get("attempts", 0)) + 1
-            atomic_write_json(self.trial_path, trial)
         else:
             slot = self.active_slot
         try:
             spec = json.loads(self.read_slot_firmware(slot).decode("utf-8"))
         except (DeviceError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            return BootResult(False, slot, None, False, f"固件无法加载: {exc}")
+            result = BootResult(False, slot, None, False, f"固件无法加载: {exc}")
+            if trial is not None:
+                atomic_write_json(self.trial_path, trial)
+            return result
         version = spec.get("version")
         if not spec.get("boot_ok", True):
-            return BootResult(False, slot, version, False, "固件自启动检查失败")
+            result = BootResult(False, slot, version, False, "固件自启动检查失败")
+            if trial is not None:
+                atomic_write_json(self.trial_path, trial)
+            return result
+        # 试启动时必须核对：槽内固件版本、配套数据格式与数据本身都要能对上，
+        # 任何一项不一致都按启动失败处理（事务不能带着错配数据确认）。
+        if trial is not None:
+            expected_fmt = int(trial.get("data_format", -1))
+            actual_fmt = self.data_format(slot)
+            if actual_fmt != expected_fmt:
+                trial["attempts"] = int(trial.get("attempts", 0))
+                atomic_write_json(self.trial_path, trial)
+                return BootResult(
+                    False, slot, version, False,
+                    f"数据格式 {actual_fmt} 与新版本要求 {expected_fmt} 不一致",
+                )
+            try:
+                self.read_data(slot)
+            except (DeviceError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                atomic_write_json(self.trial_path, trial)
+                return BootResult(False, slot, version, False,
+                                  f"配套数据无法加载: {exc}")
         healthy = bool(spec.get("health_ok", True))
         if not healthy:
-            return BootResult(True, slot, version, False, "健康检查失败")
-        return BootResult(True, slot, version, True)
+            result = BootResult(True, slot, version, False, "健康检查失败")
+        else:
+            result = BootResult(True, slot, version, True)
+            if trial is not None:
+                trial["verified"] = True  # 健康检查通过，只待外部确认
+        if trial is not None:
+            atomic_write_json(self.trial_path, trial)
+        return result
 
     def commit_trial(self) -> str:
-        """确认新版本可用：活动指针切到试启动槽，旧槽保留（供下次升级覆盖）。"""
+        """确认新版本可用：活动指针切到试启动槽（固件+数据同槽一起切换）。"""
         trial = self.trial()
         if trial is None:
             raise DeviceError("没有待确认的试启动")
+        if not trial.get("verified"):
+            raise DeviceError("试启动尚未通过健康检查，不能确认")
         slot = trial["slot"]
         atomic_write_bytes(self.active_path, slot.encode("ascii"))
         self.clear_trial()

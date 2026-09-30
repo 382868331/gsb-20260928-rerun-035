@@ -1,7 +1,10 @@
-"""端到端演示：完整成功流程 + 升级中途断电续传 + 试启动失败回退 + 不兼容。
+"""端到端演示。
 
-运行: python demo.py
-全程只用本地临时目录里的虚拟设备和项目生成的测试包。
+第一版：完整成功 + 断电续传 + 不兼容 + 失败回退。
+第二版：数据格式迁移（隔离副本）、迁移失败保护旧数据、试启动后失联回退、
+       确认重复到达幂等、多设备按批次推进与失败熔断。
+
+运行: python demo.py；全程只用本地临时目录里的虚拟设备和项目生成的测试包。
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ from pathlib import Path
 
 from edge_upgrade.manager import ActivateResult, ReceiveResult, UpgradeManager
 from edge_upgrade.package import build_package, load_package
+from edge_upgrade.fleet import DeviceStatus, FleetOrchestrator
 
 
 def _send_in_chunks(manager, pkg, chunk_size: int, *, cut_after: int | None = None) -> int:
@@ -89,6 +93,84 @@ def main() -> int:
           f"活动槽={act4.active_slot} 版本={act4.active_version}")
     retry = m4.receive_package(bad_pkg)
     print(f"[坏包重发] {retry.result.value}: {retry.message}")
+
+    # ================= 第二版：数据格式迁移 + 批次 =================
+
+    # ---- 6. 带数据格式变化的升级：隔离副本迁移，旧程序+旧数据一起保留 ----
+    v2_pkg = load_package(
+        build_package(pkg_dir / "v2-data.fwpkg", version="2.0.0", data_format=2)
+    )
+    m5 = UpgradeManager.initialize(workdir / "device5", "1.0.0")
+    active_before = m5.device.active_slot
+    old_records = m5.device.read_data(active_before)["records"]
+    print(f"[迁移前] 活动槽 {active_before} 数据示例: {old_records[0]}")
+    m5.receive_package(v2_pkg)
+    _send_in_chunks(m5, v2_pkg, chunk_size=64)
+    m5.finish_download()
+    pending = m5.boot_trial()
+    assert pending.result is ActivateResult.AWAITING_CONFIRM
+    committed = m5.confirm()
+    assert committed.result is ActivateResult.COMMITTED
+    active_after = m5.device.active_slot
+    new_records = m5.device.read_data(active_after)["records"]
+    old_slot = "A" if active_after == "B" else "B"
+    print(f"[迁移提交] 版本 {committed.active_version}，新格式记录: {new_records[0]}")
+    print(f"[旧槽保留] 槽 {old_slot} 版本={m5.device.slot_version(old_slot)} "
+          f"数据格式={m5.device.data_format(old_slot)} 记录="
+          f"{m5.device.read_data(old_slot)['records'][0]}")
+    dup_confirm = m5.confirm()
+    print(f"[确认重复] {dup_confirm.result.value}: {dup_confirm.message}")
+
+    # ---- 7. 迁移失败：旧数据一个字节都没被改，失败包重投被拒绝 ----
+    bad_migration = load_package(
+        build_package(pkg_dir / "bad-migrate.fwpkg", version="2.3.0",
+                      data_format=2, migration_ok=False)
+    )
+    m6 = UpgradeManager.initialize(workdir / "device6", "1.0.0")
+    slot = m6.device.active_slot
+    before_data = m6.device.read_data(slot)
+    m6.receive_package(bad_migration)
+    _send_in_chunks(m6, bad_migration, chunk_size=64)
+    failed = m6.finish_download()
+    print(f"[迁移失败] {failed.result.value}: {failed.message}")
+    assert m6.device.read_data(slot) == before_data
+    re = m6.receive_package(bad_migration)
+    print(f"[失败包重投] {re.result.value}: {re.message}")
+
+    # ---- 8. 试启动后失联：确认超时未到，旧程序+旧格式数据一起恢复 ----
+    m7 = UpgradeManager.initialize(workdir / "device7", "1.0.0")
+    m7.receive_package(v2_pkg)
+    _send_in_chunks(m7, v2_pkg, chunk_size=64)
+    m7.finish_download()
+    m7.boot_trial()
+    lost = m7.mark_lost_contact()
+    print(f"[失联回退] {lost.result.value}: {lost.message}; "
+          f"版本={m7.device.current_version} "
+          f"数据格式={m7.device.data_format(m7.device.active_slot)}")
+
+    # ---- 9. 多设备分批：批次 2 出现失败 -> 后续批次停止，成功设备状态保留 ----
+    fleet = FleetOrchestrator(workdir / "fleet")
+    for device_id in ("dev-1", "dev-2", "dev-3", "dev-4", "dev-5"):
+        fleet.register_device(device_id, "1.0.0")
+    good = load_package(
+        build_package(pkg_dir / "fleet-good.fwpkg", version="2.0.0", data_format=2)
+    )
+    bad_boot = load_package(
+        build_package(pkg_dir / "fleet-bad.fwpkg", version="2.1.0",
+                      data_format=2, boot_ok=False)
+    )
+    packages = {"dev-1": good, "dev-2": good, "dev-3": bad_boot,
+                "dev-4": good, "dev-5": good}
+    rollout = fleet.create_rollout(
+        "nightly", packages, batches=[["dev-1", "dev-2"], ["dev-3"], ["dev-4", "dev-5"]]
+    )
+    rollout.advance()
+    rollout.advance()  # 第二批失败熔断；第三批不会被推进
+    for device_id, record in rollout.records().items():
+        print(f"[批次结果] {device_id}: {record.status.value} ({record.version}) {record.detail}")
+    audit = rollout.audit()
+    assert all(item["ok"] for item in audit.values())
+    print(f"[一致性核对] {len(audit)} 台设备版本/数据/事务全部一致")
 
     print(f"\n演示目录（可检查真实文件）: {workdir}")
     return 0

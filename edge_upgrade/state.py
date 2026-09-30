@@ -36,6 +36,8 @@ class UpgradeState:
     target_slot: str | None = None
     payload_size: int = 0
     payload_sha256: str | None = None
+    data_format: int = 1         # 目标固件要求的数据格式版本
+    data_migrated: bool = False  # 隔离副本是否已完成迁移
     received: int = 0            # 仅作缓存；恢复时以磁盘真实长度覆盖
     result: str | None = None    # 终态结论说明
     attempts: int = 0
